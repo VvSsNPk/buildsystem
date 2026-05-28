@@ -1,5 +1,6 @@
-use crate::task::buildstep::STeX;
 use crate::task::buildtask::BuildTaskId;
+use crate::task::{TaskMap, buildstep::STeX};
+use buildsystem::utils::time::{Delta, Timestamp};
 use either::Either;
 use petgraph::{
     graph::{DiGraph, NodeIndex},
@@ -10,15 +11,34 @@ pub mod macros;
 pub mod task;
 
 fn main() {
-    let x = make_dep!(1 => 2,2 => 3,3=>4,4=>3,3=>5,5=>6,7=>6,8=> 7,9=>6,6=> 13,13=>14,15=>14,14=>12,16=>12,12=>11,11=>10,10=>6);
-    //let x = make_dep!(1=>2,2=>3,2=>4,3=>5,3=>6,3=>7,4=>8,4=>9,4=>10);
-    //let x = make_dep!(2 => 1,1=>0,0=>2,2=>4,4=>3,3=>2);
-    let d_g = x.create_graph();
-    let sccs = kosaraju(&d_g.0);
-    for i in sccs {
+    let (scss, t) = measure(|| {
+        let (x, t) = measure(
+            || //make_dep!(1 => 2,2 => 3,3=>4,4=>3,3=>5,5=>6,7=>6,8=> 7,9=>6,6=> 13,13=>14,15=>14,14=>12,16=>12,12=>11,11=>10,10=>6),
+            TaskMap::create_map(10000),
+        );
+        println!("Inited in {t}");
+
+        //let x = make_dep!(1=>2,2=>3,2=>4,3=>5,3=>6,3=>7,4=>8,4=>9,4=>10);
+        //let x = make_dep!(2 => 1,1=>0,0=>2,2=>4,4=>3,3=>2);
+        let (d_g, t) = measure(|| x.0.create_graph());
+        println!("Created in {t}");
+        // ?????
+        let (r, t) = measure(|| kosaraju(&d_g.0));
+        println!("kosaraju: {t}");
+        r
+    });
+    /*for i in sccs {
         let k_p = i.iter().filter_map(|nd| d_g.1.get(nd)).collect::<Vec<_>>();
         println!("{:?}", k_p);
-    }
+    }*/
+    println!("Total: {t}")
+}
+
+pub fn measure<R>(f: impl FnOnce() -> R) -> (R, Delta) {
+    let now = Timestamp::now();
+    let r = f();
+    let delta = now.since_now();
+    (r, delta)
 }
 
 #[macro_export]
@@ -34,6 +54,7 @@ macro_rules! make_dep{
     };
 }
 
+/// ?????
 pub struct SCC<N>(Either<N, Vec<N>>);
 
 impl<N> SCC<N> {
@@ -58,8 +79,8 @@ impl<N> std::ops::Deref for SCC<N> {
     }
 }
 
-// This is kosaraju scc algorithm
-// Here instead of giving node index we give something else
+// This is kosaraju scc algorithm (what does it do? )
+// Here instead of giving node index we give <something else>(???)
 pub fn kosaraju(g: &DiGraph<(BuildTaskId, STeX), ()>) -> Vec<Vec<NodeIndex>> {
     let mut dfs = DfsPostOrder::empty(g);
     let mut finish_order = Vec::new();

@@ -36,7 +36,7 @@ impl Queue {
     }
 
     pub fn start(&mut self) {
-        let mut store = self.map.map.values().cloned().collect::<Vec<_>>();
-        store.sort_by(|b1, b2| todo!());
+        let mut store = self.map.map.values().cloned().collect::<Vec<_>>(); // that seems... expensive?
+        store.sort_by(|b1, b2| todo!()); // why not just sort them directly? (depends on what happens afterwards, of course. .sort_by likely won't be applicable (needs binary relation))
     }
 }

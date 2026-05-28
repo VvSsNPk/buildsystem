@@ -19,14 +19,14 @@ impl From<BuildTaskId> for usize {
 #[derive(Debug, Clone)]
 pub struct BuildTask {
     id: BuildTaskId,
-    steps: Box<[Rc<RefCell<BuildStep>>]>,
+    steps: Box<[Rc<RefCell<BuildStep>>]>, // Rc<RefCell<>> is an antipattern (not necessarily wrong, but should be carefully considered. Usually / often, it means your data could be organised better)
 }
 
 impl BuildTask {
     pub fn new(id: usize) -> Self {
         let mut temp = Vec::new();
-        for i in STeX::initialize() {
-            let buildstep = BuildStep::new(*i);
+        for i in STeX::all() {
+            let buildstep = BuildStep::new(i);
             temp.push(Rc::new(RefCell::new(buildstep)));
         }
         Self {
@@ -43,38 +43,45 @@ impl BuildTask {
     }
 
     pub fn root_task(&self) -> bool {
+        // should be harmless, but note that you're borrowing all dependencies here, so if *any* is borrowed mutably at any point, your program will just crash.
         self.steps.iter().all(|k| k.borrow().dep.is_empty())
     }
 
+    // Ok, this works, *but*: it returns a cycle *if and only if* self *itself* is part of the cycle (hence, the name makes perfect sense).
+    // Possibly dangerous...? If self *depends on* a cycle... won't just nxt grow infinitely big...?
+    // => But: can therefore be "optimized" - if you break when nxt.contains(inseter), you break if you have found *any* cycle.
+    // If you do: checking whether dep.buildtaskid == self.id still tells you whether self is cyclic, but you can also store
+    // the found cycle somewhere, so you never have to call is_cyclic for any of the tasks in the found cycle.
+    // You can *also* mark the ones where you did *not* find a cycle and thus never look at the same task twice.
     pub fn is_cyclic(&self) -> Option<Vec<(BuildTaskId, STeX)>> {
+        // consists of: a) Dependency (BuildTask+BuildStep) and b) the tasks it is a dependency *of*
         let mut f1 = self
             .steps
             .iter()
             .flat_map(|bstp| {
-                let temp = bstp
-                    .borrow()
-                    .dep
+                let bor = bstp.borrow();
+                bor.dep
                     .iter()
-                    .cloned()
-                    .map(|d| (d, vec![(self.id, bstp.borrow().get_task_id())]))
-                    .collect::<Vec<_>>();
-                temp
+                    .map(|d| (d.clone(), vec![(self.id, bor.get_task_id())])) // vec, collect, another collect, and cloned can definitely be optimized, but probably needs a proper loop rather than map/flat_map etc because of borrow checker
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         let mut visited = HashSet::new();
-        while let Some(x) = f1.pop() {
-            let inseter = (x.0.buildtaskid, x.0.step.borrow().get_task_id());
+        while let Some((dep, ancestors)) = f1.pop() {
+            // self is in cycle
+            if dep.buildtaskid == self.id {
+                return Some(ancestors);
+            }
+            let inseter = (dep.buildtaskid, dep.step.borrow().get_task_id());
             if !visited.contains(&inseter) {
                 visited.insert(inseter);
-                let y = x.0.step.borrow().dep.clone();
+                let y = dep.step.borrow().dep.clone();
                 for mk in y {
-                    let mut nxt = x.1.clone();
-                    nxt.push((x.0.buildtaskid, x.0.step.borrow().get_task_id()));
+                    // if ancestors contains mk, you found a cycle (not including self)!
+                    let mut nxt = ancestors.clone();
+                    nxt.push((dep.buildtaskid, dep.step.borrow().get_task_id())); // <- this is just inseter again
                     f1.push((mk, nxt));
                 }
-            }
-            if inseter.0 == self.id {
-                return Some(x.1);
             }
         }
         None

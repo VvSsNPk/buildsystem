@@ -6,7 +6,7 @@ use std::{
 };
 
 use petgraph::graph::{DiGraph, NodeIndex};
-use rand::{rng, seq::IteratorRandom};
+use rand::{RngExt, rng, seq::IteratorRandom};
 
 use crate::task::{
     buildstep::{BuildStep, Dependency, STeX},
@@ -31,6 +31,16 @@ impl<K: Hash> TaskMap<K> {
 }
 
 impl TaskMap<BuildTaskId> {
+    pub fn entirely_random(max_tasks: usize) -> Self {
+        let mut taskmap = TaskMap::new();
+        for i in 0..max_tasks {
+            taskmap.map.insert(BuildTaskId::from(i), BuildTask::new(i));
+        }
+        for i in 0..max_tasks {
+            TODO
+        }
+        taskmap
+    }
     pub fn create_map(max_tasks: usize) -> (Self, HashSet<(usize, usize, usize)>) {
         let mut taskmap = TaskMap::new();
         for i in 0..max_tasks {
@@ -45,7 +55,7 @@ impl TaskMap<BuildTaskId> {
             if !created.insert((x[0], x[1], x[2])) {
                 continue;
             }
-            println!("({},{},{})", x[0], x[1], x[2]);
+            //println!("({},{},{})", x[0], x[1], x[2]);
             taskmap.create_three_dep(
                 BuildTaskId::from(x[0]),
                 BuildTaskId::from(x[1]),
