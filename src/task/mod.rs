@@ -41,12 +41,10 @@ impl TaskMap<BuildTaskId> {
             taskmap.map.insert(BuildTaskId::from(i), BuildTask::new(i));
         }
         for i in 0..max_tasks {
-            let mut deps = Vec::new();
-            taskmap.map.iter().sample_fill(&mut rng, &mut deps);
-            let it: Vec<usize> = deps.iter().map(|x| (*x.0).into()).collect();
-            for j in it {
-                if j != i {
-                    taskmap.create_link(i, j);
+            for j in 0..m {
+                let x = (0..max_tasks).choose(&mut rng).unwrap();
+                if x != i {
+                    taskmap.create_link(i, x);
                 }
             }
         }
