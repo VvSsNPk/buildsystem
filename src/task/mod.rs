@@ -34,35 +34,20 @@ impl<K: Hash> TaskMap<K> {
 }
 
 impl TaskMap<BuildTaskId> {
-    pub fn entirely_random(max_tasks: usize, m0: usize, m: usize) -> Self {
+    pub fn entirely_random(max_tasks: usize, m: usize) -> Self {
         let mut taskmap = TaskMap::new();
         let mut rng = rng();
         for i in 0..max_tasks {
             taskmap.map.insert(BuildTaskId::from(i), BuildTask::new(i));
         }
-        for i in 0..m0 {
-            // TODO
-            for j in i + 1..m0 {
-                taskmap.create_link(i, j);
-            }
-        }
-
-        for i in m0..max_tasks {
-            let mut possible_targets: Vec<BuildTaskId> = (0..i).map(BuildTaskId::from).collect();
-            for _ in 0..m {
-                let j = possible_targets
-                    .choose_weighted(&mut rng, |&y| {
-                        taskmap
-                            .get_build_step(y, STeX::Pdflatex2)
-                            .borrow()
-                            .dep
-                            .len()
-                    })
-                    .unwrap()
-                    .to_owned();
-                let num: usize = j.into();
-                taskmap.create_link(i, num);
-                possible_targets.retain(|&x| x != j);
+        for i in 0..max_tasks {
+            let mut deps = Vec::new();
+            taskmap.map.iter().sample_fill(&mut rng, &mut deps);
+            let it: Vec<usize> = deps.iter().map(|x| (*x.0).into()).collect();
+            for j in it {
+                if j != i {
+                    taskmap.create_link(i, j);
+                }
             }
         }
         taskmap

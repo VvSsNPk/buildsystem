@@ -15,7 +15,7 @@ fn main() {
         let (x, t) = measure(
             || //make_dep!(1 => 2,2 => 3,3=>4,4=>3,3=>5,5=>6,7=>6,8=> 7,9=>6,6=> 13,13=>14,15=>14,14=>12,16=>12,12=>11,11=>10,10=>6),
             // TaskMap::create_map(10000),
-            TaskMap::entirely_random(30000, 30, 6),
+            TaskMap::entirely_random(30000, 10),
         );
         println!("Inited in {t}");
 
