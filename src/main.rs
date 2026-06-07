@@ -1,13 +1,9 @@
-use crate::task::buildstep::STeX;
-use crate::task::buildtask::BuildTaskId;
-use either::Either;
-use petgraph::{
-    graph::{DiGraph, NodeIndex},
-    visit::{Dfs, DfsPostOrder, IntoNodeIdentifiers, Reversed, VisitMap},
-};
+use crate::{scc::kosaraju, scc::extract_sub_graph};
+use rustworkx_core::connectivity::johnson_simple_cycles;
 
 pub mod macros;
 pub mod task;
+pub mod scc;
 
 fn main() {
     let x = make_dep!(1 => 2,2 => 3,3=>4,4=>3,3=>5,5=>6,7=>6,8=> 7,9=>6,6=> 13,13=>14,15=>14,14=>12,16=>12,12=>11,11=>10,10=>6);
@@ -15,9 +11,14 @@ fn main() {
     //let x = make_dep!(2 => 1,1=>0,0=>2,2=>4,4=>3,3=>2);
     let d_g = x.create_graph();
     let sccs = kosaraju(&d_g.0);
+    println!("simple cycles begins here");
     for i in sccs {
-        let k_p = i.iter().filter_map(|nd| d_g.1.get(nd)).collect::<Vec<_>>();
-        println!("{:?}", k_p);
+        let new_graph = extract_sub_graph(&d_g.0, &i);
+        let mut cycles = johnson_simple_cycles(&new_graph.0, None);
+        while let Some(k) =  cycles.next(&new_graph.0){
+            let k_p = k.iter().filter_map(|nd|new_graph.1.get(nd)).collect::<Vec<_>>();
+            println!("{:?}",k_p);
+        }
     }
 }
 
@@ -34,72 +35,4 @@ macro_rules! make_dep{
     };
 }
 
-pub struct SCC<N>(Either<N, Vec<N>>);
 
-impl<N> SCC<N> {
-    pub fn new(n: N) -> Self {
-        Self(Either::Left(n))
-    }
-
-    pub fn new_cycle(n: Vec<N>) -> Self {
-        Self(Either::Right(n))
-    }
-}
-
-// This causes error when the cycle size is less than one
-impl<N> std::ops::Deref for SCC<N> {
-    type Target = N;
-
-    fn deref(&self) -> &Self::Target {
-        match &self.0 {
-            Either::Left(x) => x,
-            Either::Right(x) => x.first().expect("should be atleast 1 size"),
-        }
-    }
-}
-
-// This is kosaraju scc algorithm
-// Here instead of giving node index we give something else
-pub fn kosaraju(g: &DiGraph<(BuildTaskId, STeX), ()>) -> Vec<Vec<NodeIndex>> {
-    let mut dfs = DfsPostOrder::empty(g);
-    let mut finish_order = Vec::new();
-    for i in g.node_identifiers() {
-        if dfs.discovered.is_visited(&i) {
-            continue;
-        }
-        dfs.move_to(i);
-        while let Some(nx) = dfs.next(Reversed(g)) {
-            finish_order.push(nx);
-        }
-    }
-
-    let mut dfs = Dfs::from_parts(dfs.stack, dfs.discovered);
-    dfs.reset(g);
-    let mut sccs = Vec::new();
-    for i in finish_order.into_iter().rev() {
-        if dfs.discovered.is_visited(&i) {
-            continue;
-        }
-        dfs.move_to(i);
-        let mut scc = Vec::new();
-        while let Some(nx) = dfs.next(g) {
-            scc.push(nx)
-        }
-        if scc.len() > 1 {
-            let scc_clone = scc.clone();
-            scc.sort_by(|n1, n2| {
-                let childern = g
-                    .neighbors_directed(*n1, petgraph::Direction::Incoming)
-                    .filter(|n| scc_clone.contains(n))
-                    .count();
-                let childern2 = g
-                    .neighbors_directed(*n2, petgraph::Direction::Incoming)
-                    .filter(|n| scc_clone.contains(n))
-                    .count();
-                childern2.cmp(&childern)
-            });
-        }
-        sccs.push(scc);
-    }
-    sccs
-}
