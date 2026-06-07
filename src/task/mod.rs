@@ -41,10 +41,10 @@ impl TaskMap<BuildTaskId> {
             taskmap.map.insert(BuildTaskId::from(i), BuildTask::new(i));
         }
         for i in 0..max_tasks {
-            for j in 0..m {
+            for _ in 0..m {
                 let x = (0..max_tasks).choose(&mut rng).unwrap();
                 if x != i {
-                    taskmap.create_link(i, x);
+                    taskmap.create_link(x, i);
                 }
             }
         }
