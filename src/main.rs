@@ -1,5 +1,6 @@
 use crate::task::buildtask::BuildTaskId;
 use crate::task::{TaskMap, buildstep::STeX};
+use buildsystem::cycle_handler::run2;
 use buildsystem::utils::time::{Delta, Timestamp};
 use either::Either;
 use petgraph::{
@@ -14,24 +15,17 @@ fn main() {
     let (scss, t) = measure(|| {
         let (x, t) = measure(
             || //make_dep!(1 => 2,2 => 3,3=>4,4=>3,3=>5,5=>6,7=>6,8=> 7,9=>6,6=> 13,13=>14,15=>14,14=>12,16=>12,12=>11,11=>10,10=>6),
-            // TaskMap::create_map(10000),
-            TaskMap::entirely_random(30000, 10),
+            TaskMap::entirely_random(50000, 10),
         );
         println!("Inited in {t}");
 
-        //let x = make_dep!(1=>2,2=>3,2=>4,3=>5,3=>6,3=>7,4=>8,4=>9,4=>10);
-        //let x = make_dep!(2 => 1,1=>0,0=>2,2=>4,4=>3,3=>2);
         let (d_g, t) = measure(|| x.create_graph());
         println!("Created in {t}");
-        // ?????
+
         let (r, t) = measure(|| kosaraju(&d_g.0));
         println!("kosaraju: {t}");
         r
     });
-    /*for i in sccs {
-        let k_p = i.iter().filter_map(|nd| d_g.1.get(nd)).collect::<Vec<_>>();
-        println!("{:?}", k_p);
-    }*/
     println!("Total: {t}")
 }
 
@@ -82,7 +76,7 @@ impl<N> std::ops::Deref for SCC<N> {
 
 // This is kosaraju scc algorithm (what does it do? )
 // Here instead of giving node index we give <something else>(???)
-pub fn kosaraju(g: &DiGraph<(BuildTaskId, STeX), ()>) -> Vec<Vec<NodeIndex>> {
+pub fn kosaraju(g: &DiGraph<(BuildTaskId, STeX), ()>) -> Vec<NodeIndex> {
     let mut dfs = DfsPostOrder::empty(g);
     let mut finish_order = Vec::new();
     for i in g.node_identifiers() {
@@ -108,20 +102,23 @@ pub fn kosaraju(g: &DiGraph<(BuildTaskId, STeX), ()>) -> Vec<Vec<NodeIndex>> {
             scc.push(nx)
         }
         if scc.len() > 1 {
-            let scc_clone = scc.clone();
-            scc.sort_by(|n1, n2| {
-                let childern = g
-                    .neighbors_directed(*n1, petgraph::Direction::Incoming)
-                    .filter(|n| scc_clone.contains(n))
-                    .count();
-                let childern2 = g
-                    .neighbors_directed(*n2, petgraph::Direction::Incoming)
-                    .filter(|n| scc_clone.contains(n))
-                    .count();
-                childern2.cmp(&childern)
-            });
+            let mut x = vec![];
+            let mut root = (*scc.first().unwrap(), 0);
+            for i in scc.iter() {
+                let child = g
+                    .neighbors_directed(*i, petgraph::Direction::Outgoing)
+                    .filter(|n| scc.contains(n))
+                    .collect::<Vec<_>>();
+                if child.len() > root.1 {
+                    root = (*i, child.len());
+                }
+                x.push((*i, child))
+            }
+            let x = run2(&x, root.0);
+            sccs.extend_from_slice(&x);
+        } else {
+            sccs.push(*scc.first().unwrap());
         }
-        sccs.push(scc);
     }
     sccs
 }
