@@ -114,7 +114,8 @@ async fn create_graph() {
     let (rc, mut sc) = tokio::sync::mpsc::unbounded_channel();
     let visited = Arc::new(Mutex::new(HashSet::new()));
     let cycle = Arc::new(Mutex::new(HashSet::new()));
-    run2(g, x.clone(), sem, rc.clone(), visited, &mut sc, cycle).await;
+    rc.send((true, x.clone())).unwrap();
+    run2(g, x.clone(), sem, rc, visited, &mut sc, cycle).await;
     println!("finished");
 }
 
@@ -136,6 +137,7 @@ pub async fn run<T: Clone + Eq + Hash + Send + Sync + 'static>(
     // I did this becasue the stack is shared across threads because used in spawn_blocking
 }
 
+// So this is for cycles but if there are no cycles then ?
 async fn run2<T: Clone + Eq + Hash + Send + Sync + 'static>(
     g: Graph<T>,
     root: Task<T>,
@@ -159,7 +161,7 @@ async fn run2<T: Clone + Eq + Hash + Send + Sync + 'static>(
                     lc.insert(x.clone());
                     drop(lc);
                     // some work is done we do no care about failure
-                    sleep(Duration::from_secs(x.0._num as u64));
+                    //sleep(Duration::from_secs(x.0._num as u64));
                     if b {
                         let children = find_wrapper_children(&graph, x)
                             .iter()
