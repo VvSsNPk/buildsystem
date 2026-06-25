@@ -1,4 +1,10 @@
-use std::{collections::HashSet, hash::Hash, sync::Arc, thread::sleep, time::Duration};
+use std::{
+    collections::{HashSet, VecDeque},
+    hash::Hash,
+    sync::{Arc, atomic::AtomicUsize},
+    thread::sleep,
+    time::Duration,
+};
 
 use parking_lot::{Mutex, RwLock};
 use rand::{RngExt, rng};
@@ -18,6 +24,7 @@ use crate::{
 pub struct TaskI<T: Clone + Hash> {
     node: T,
     // this should be rng
+    deps: Arc<AtomicUsize>,
     _num: usize,
     state: RwLock<TaskState>,
 }
@@ -38,12 +45,12 @@ impl<T: Clone + Eq + Hash> Eq for TaskI<T> {}
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Task<T: Clone + Eq + Hash>(Arc<TaskI<T>>);
 impl<T: Clone + Hash + Eq> Task<T> {
-    pub fn new(task: T) -> Self {
-        let taski = TaskI::new(task);
+    pub fn new(task: T, deps: usize) -> Self {
+        let taski = TaskI::new(task, deps);
         Self(Arc::new(taski))
     }
-    pub fn new_with_timer(t: T, n: usize) -> Self {
-        let taski = TaskI::new_with_timer(t, n);
+    pub fn new_with_timer(t: T, n: usize, deps: usize) -> Self {
+        let taski = TaskI::new_with_timer(t, n, deps);
         Self(Arc::new(taski))
     }
     fn updat_state(&mut self, state: TaskState) {
@@ -53,19 +60,21 @@ impl<T: Clone + Hash + Eq> Task<T> {
 }
 
 impl<T: Clone + Hash> TaskI<T> {
-    pub fn new(t: T) -> Self {
+    pub fn new(t: T, deps: usize) -> Self {
         let mut rng = rng();
         let n = rng.random_range(2..10);
         Self {
             node: t,
+            deps: Arc::new(AtomicUsize::new(deps)),
             _num: n,
             state: RwLock::new(TaskState::Queued),
         }
     }
 
-    pub fn new_with_timer(t: T, n: usize) -> Self {
+    pub fn new_with_timer(t: T, n: usize, deps: usize) -> Self {
         Self {
             node: t,
+            deps: Arc::new(AtomicUsize::new(deps)),
             _num: n,
             state: RwLock::new(TaskState::Queued),
         }
@@ -97,7 +106,7 @@ async fn create_graph() {
         (Node::N, vec![Node::I]),
         (Node::O, vec![Node::L]),
     ];
-    let tasks: Vec<_> = g.iter().map(|(n, _)| Task::new(*n)).collect();
+    let tasks: Vec<_> = g.iter().map(|(n, k)| Task::new(*n, k.len())).collect();
     let mut store = Vec::new();
     for i in g {
         let root = tasks.iter().find(|k| k.0.node == i.0).unwrap().clone();
@@ -110,12 +119,6 @@ async fn create_graph() {
     }
     let x = tasks.iter().find(|r| r.0.node == Node::C).unwrap();
     let g: Graph<Node> = store.into();
-    let sem = Arc::new(Semaphore::new(4));
-    let (rc, mut sc) = tokio::sync::mpsc::unbounded_channel();
-    let visited = Arc::new(Mutex::new(HashSet::new()));
-    let cycle = Arc::new(Mutex::new(HashSet::new()));
-    rc.send((true, x.clone())).unwrap();
-    run2(g, x.clone(), sem, rc, visited, &mut sc, cycle).await;
     println!("finished");
 }
 
@@ -125,72 +128,48 @@ async fn create_graph() {
 // Only for strongly connected components
 type Graph<T> = Arc<[(Task<T>, Vec<Task<T>>)]>;
 
-pub async fn run<T: Clone + Eq + Hash + Send + Sync + 'static>(
-    g: Graph<T>,
-    root: Task<T>,
-    sem: Arc<Semaphore>,
-    stack: Arc<Mutex<Vec<Task<T>>>>,
-    visited: Arc<Mutex<HashSet<Task<T>>>>,
-    // Here the problem is that the tail remainder has an order and we need to run the things in that order
-    cycle_tail: Arc<Mutex<Vec<Task<T>>>>,
-) {
-    // I did this becasue the stack is shared across threads because used in spawn_blocking
-}
-
 // So this is for cycles but if there are no cycles then ?
-async fn run2<T: Clone + Eq + Hash + Send + Sync + 'static>(
-    g: Graph<T>,
-    root: Task<T>,
-    sem: Arc<Semaphore>,
-    sender: UnboundedSender<(bool, Task<T>)>,
-    visited: Arc<Mutex<HashSet<Task<T>>>>,
-    rc: &mut UnboundedReceiver<(bool, Task<T>)>,
-    second_run: Arc<Mutex<HashSet<Task<T>>>>,
-) {
-    while let Some((b, x)) = rc.recv().await {
-        if let Ok(permit) = Semaphore::acquire_owned(sem.clone()).await {
-            // do some workhere
-            let y = root.0.node.clone();
-            let graph = g.clone();
-            let sender = sender.clone();
-            let vis = visited.clone();
-            let sc = second_run.clone();
-            spawn_blocking(move || {
-                let mut lc = vis.lock();
-                if !lc.contains(&x) {
-                    lc.insert(x.clone());
-                    drop(lc);
-                    // some work is done we do no care about failure
-                    //sleep(Duration::from_secs(x.0._num as u64));
-                    if b {
-                        let children = find_wrapper_children(&graph, x)
-                            .iter()
-                            .filter(|n| n.0.node != y);
-                        let s = sender;
-                        let second_acquire = vis.lock();
-                        let another = sc.lock();
-                        for i in children {
-                            if !second_acquire.contains(i) {
-                                if !another.contains(i) {
-                                    s.send((false, i.clone())).expect("unable to send task");
-                                }
-                            } else {
-                                s.send((true, i.clone())).expect("error");
-                            }
-                        }
-                        drop(second_acquire);
-                        drop(another);
-                        drop(s);
-                    }
-                } else {
-                    drop(sender);
-                }
 
-                drop(permit)
-            });
+pub async fn run_task_queue<T: Clone + Eq + Hash + Send + Sync  + 'static>(
+    graph: Graph<T>,
+    store: Arc<Mutex<VecDeque<Task<T>>>>,
+    semaphore: Arc<Semaphore>,
+) {
+    // assumption is that store is pre sorted here
+    let counter = Arc::new(AtomicUsize::new(0));
+    while let Ok(p) = Semaphore::acquire_owned(semaphore.clone()).await {
+        let mut task_lock = store.lock();
+        // here we need to check the end of the task and if there are no dependencies left then only pop else
+        let task = task_lock.iter().last().unwrap();
+        let pending = task.0.deps.load(std::sync::atomic::Ordering::Relaxed);
+        let str = Arc::clone(&store);
+        let g = graph.clone();
+        // here the stack is popped, is there a way to pop from front and back asynchronously and getting tasks from front and back ?
+        if pending == 0 {
+            if let Some(task) = task_lock.pop_back() {
+                drop(task_lock);
+                let counter_clone = Arc::clone(&counter);
+                spawn_blocking(move || {
+                    let t = task;
+                    counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    sleep(Duration::from_secs(t.0._num as u64));
+                    counter_clone.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut to_sort = str.lock();
+                    to_sort.make_contiguous().sort_by(|a, b| {
+                        let m = find_wrapper_children(&g, a.clone()).len();
+                        let n = find_wrapper_children(&g, b.clone()).len();
+                        n.cmp(&m)
+                    });
+                    drop(to_sort);
+                    drop(p);
+                });
+            }
+        } else {
+            let counter_break = counter.load(std::sync::atomic::Ordering::Relaxed);
+            let k = store.lock();
+            if counter_break == 0 && k.is_empty() {
+                break;
+            }
         }
     }
 }
-
-#[tokio::test(flavor = "multi_thread")]
-async fn fixpoint_parallel_algorithm() {}
