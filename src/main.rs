@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::task::buildtask::BuildTaskId;
 use crate::task::{TaskMap, buildstep::STeX};
@@ -12,11 +12,16 @@ use petgraph::{
     graph::{DiGraph, NodeIndex},
     visit::{Dfs, DfsPostOrder, IntoNodeIdentifiers, Reversed, VisitMap},
 };
+use tracing::Level;
 
 pub mod macros;
 pub mod task;
 
 fn main() {
+    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+    let mut k = VecDeque::from([3, 5, 7]);
+    k.make_contiguous().sort_by(|x, y| y.cmp(x));
+    println!("{:?}", k);
     // let (scss, t) = measure(|| {
     //     let (x, t) = measure(
     //         || //make_dep!(1 => 2,2 => 3,3=>4,4=>3,3=>5,5=>6,7=>6,8=> 7,9=>6,6=> 13,13=>14,15=>14,14=>12,16=>12,12=>11,11=>10,10=>6),
@@ -161,7 +166,7 @@ pub fn kosaraju(g: &DiGraph<(BuildTaskId, STeX), ()>) -> Vec<NodeIndex> {
                 }
                 x.push((*i, child))
             }
-            let x = run2(&x, root.0);
+            let x = run2(&mut x, root.0);
             sccs.extend_from_slice(&x);
         } else {
             sccs.push(*scc.first().unwrap());

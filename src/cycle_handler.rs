@@ -29,7 +29,7 @@ macro_rules! make_graph_ai {
 // So we run johson simple cycles and identify the cyles
 #[test]
 pub fn create_example_graph() {
-    let g = [
+    let mut g = [
         (Node::A, vec![Node::B]),
         (Node::B, vec![Node::E, Node::C, Node::K]),
         (Node::C, vec![Node::D, Node::F, Node::G]),
@@ -57,7 +57,7 @@ pub fn create_example_graph() {
 
     // run largest node : Node::C
     //
-    let x = run(&g, Node::C);
+    let x = run(&mut g, Node::C);
     assert_eq!(
         x,
         vec![
@@ -77,7 +77,7 @@ pub fn create_example_graph() {
     )
 }
 
-pub fn run(g: &[(Node, Vec<Node>)], root: Node) -> Vec<Node> {
+pub fn run(g: &mut [(Node, Vec<Node>)], root: Node) -> Vec<Node> {
     let mut stack = vec![root];
     let mut already_ran = HashSet::new();
     let mut remainder = vec![root];
@@ -128,13 +128,13 @@ pub fn run(g: &[(Node, Vec<Node>)], root: Node) -> Vec<Node> {
 //
 #[test]
 fn run2_test() {
-    let g = [
+    let mut g = [
         (Node::A, vec![Node::B, Node::C]),
         (Node::B, vec![Node::D, Node::A]),
         (Node::C, vec![Node::A]),
         (Node::D, vec![Node::B]),
     ];
-    let x = run2(&g, Node::A);
+    let x = run2(&mut g, Node::A);
     assert_eq!(
         x,
         vec![Node::A, Node::B, Node::C, Node::D, Node::B, Node::A]
@@ -146,7 +146,7 @@ fn run2_test() {
 /// what if we flip the edges ? and run it now children for C are B H F J
 /// we first pick the node that has max dependencies
 /// Now we have to think about running it async
-pub fn run2<N: Eq + Clone + Copy>(g: &[(N, Vec<N>)], root: N) -> Vec<N> {
+pub fn run2<N: Eq + Clone + Copy>(g: &mut [(N, Vec<N>)], root: N) -> Vec<N> {
     let mut current = 0;
     let mut result = vec![root];
     let mut remainder = vec![root];
@@ -200,7 +200,7 @@ pub fn run2<N: Eq + Clone + Copy>(g: &[(N, Vec<N>)], root: N) -> Vec<N> {
 
 #[test]
 fn test3() {
-    let g = make_graph_ai!(
+    let mut g = make_graph_ai!(
         A -> [B] ,
         B -> [K,E,C] ,
         C -> [G,F,D,J] ,
@@ -215,19 +215,16 @@ fn test3() {
         L -> [O,B] ,
         M -> [I] ,
         N -> [I], O -> [L],P -> [I] );
-    let x = run2(&g, Node::C);
-    let y = run(&g, Node::C);
+    let x = run2(&mut g, Node::C);
+    let y = run(&mut g, Node::C);
     assert_eq!(x, y)
 }
 
 // gets the next deps that it needs to run after running the node :Node
-pub fn find_wrapper_children<N: Eq>(g: &[(N, Vec<N>)], node: N) -> &[N] {
-    &g.iter().find(|(n, _)| *n == node).unwrap().1
+pub fn find_wrapper_children<N: Eq>(g: &mut [(N, Vec<N>)], node: N) -> &mut [N] {
+    &mut g.iter_mut().find(|(n, _)| *n == node).unwrap().1
 }
 // This  function checks whether n is immediate to node i.e A -> B -> A
-pub fn is_immeaidate_in_cycle(g: &[(Node, Vec<Node>)], n: Node, node: Node) -> bool {
-    find_wrapper_children(g, n).contains(&node)
-}
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
 pub enum Node {
