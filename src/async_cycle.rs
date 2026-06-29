@@ -2,8 +2,8 @@ use std::{
     collections::{HashSet, VecDeque},
     fmt::Debug,
     hash::Hash,
+    hint::unreachable_unchecked,
     sync::{Arc, atomic::AtomicUsize},
-    thread::sleep,
     time::Duration,
     vec,
 };
@@ -13,7 +13,7 @@ use rand::{RngExt, rng};
 use tokio::{
     spawn,
     sync::{
-        Semaphore,
+        OwnedSemaphorePermit, Semaphore,
         mpsc::{UnboundedReceiver, UnboundedSender},
     },
     task::spawn_blocking,
@@ -28,7 +28,7 @@ use crate::{
 pub struct TaskI<T: Clone + Hash> {
     node: T,
     // this should be rng
-    deps: Arc<AtomicUsize>,
+    unbuilt_dependencies: Arc<AtomicUsize>,
     _num: usize,
     state: RwLock<TaskState>,
 }
@@ -69,7 +69,7 @@ impl<T: Clone + Hash> TaskI<T> {
         let n = rng.random_range(1..4);
         Self {
             node: t,
-            deps: Arc::new(AtomicUsize::new(deps)),
+            unbuilt_dependencies: Arc::new(AtomicUsize::new(deps)),
             _num: n,
             state: RwLock::new(TaskState::Queued),
         }
@@ -78,7 +78,7 @@ impl<T: Clone + Hash> TaskI<T> {
     pub fn new_with_timer(t: T, n: usize, deps: usize) -> Self {
         Self {
             node: t,
-            deps: Arc::new(AtomicUsize::new(deps)),
+            unbuilt_dependencies: Arc::new(AtomicUsize::new(deps)),
             _num: n,
             state: RwLock::new(TaskState::Queued),
         }
@@ -128,7 +128,7 @@ async fn create_graph() {
         }
         store.push((root, store2));
     }
-    let g: Graph<Node> = Arc::new(Mutex::new(store));
+    let g: DepencyMap<Node> = Arc::new(Mutex::new(store));
     let store = Arc::new(Mutex::new(tasks.into()));
     let sem = Semaphore::new(2);
     info!("now running");
@@ -140,97 +140,130 @@ async fn create_graph() {
 // Strongly conected
 // This seems right
 // Only for strongly connected components
-type Graph<T> = Arc<Mutex<Vec<(Task<T>, Vec<Task<T>>)>>>;
+type DepencyMap<T> = Arc<Mutex<Vec<(Task<T>, Vec<Task<T>>)>>>;
 
 // So this is for cycles but if there are no cycles then ?
 
 pub async fn run_task_queue<T: Clone + Eq + Debug + Hash + Send + Sync + 'static>(
-    graph: Graph<T>,
-    store: Arc<Mutex<VecDeque<Task<T>>>>,
+    graph: DepencyMap<T>,
+    queue: Arc<Mutex<VecDeque<Task<T>>>>, // <- turns out, this being a VecDeque doesn't buy us anything, because .make_contiguous just "turns it into a Vec" every time anyway
     semaphore: Arc<Semaphore>,
 ) {
     // assumption is that store is pre sorted here
     info!("executing");
     let counter = Arc::new(AtomicUsize::new(0));
-    while let Ok(p) = Semaphore::acquire_owned(semaphore.clone()).await {
-        let mut task_lock = store.lock();
+    while let Ok(permit) = Semaphore::acquire_owned(semaphore.clone()).await {
+        let mut queue_lock = queue.lock();
         // here we need to check the end of the task and if there are no dependencies left then only pop else
         // Constantly checks the queue for some items until the semaphore permits are there
         // What do we need here ? we need some kind of mechanism that can track time because if there are items then we need to check when they are executed
-        if let Some(task) = task_lock.iter().last() {
-            let pending = task.0.deps.load(std::sync::atomic::Ordering::Relaxed);
-            let str = Arc::clone(&store);
-            let g = graph.clone();
-            // here the stack is popped, is there a way to pop from front and back asynchronously and getting tasks from front and back ?
-            if pending == 0 {
-                // pending is last element of the queue we are sorting the queue all the time so it is possible that the last element is not 0 then there are cycles maybe ?
-                if let Some(task) = task_lock.pop_back() {
-                    info!("the task popped {:?}", task);
-                    drop(task_lock);
-                    let counter_clone = Arc::clone(&counter);
-
-                    // we move the data inside the thread
-                    spawn_blocking(move || {
-                        let time = std::time::Instant::now();
-                        info!("time is {:?}", time);
-                        let t = task;
-                        let mut gk = g.lock();
-                        //let child = find_wrapper_children(&mut gk, t.clone());
-                        counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let t1 = time.elapsed();
-                        info!("started the task {:?} at time {} secs", t, t1.as_secs());
-                        sleep(Duration::from_secs(t.0._num as u64));
-                        let t2 = time.elapsed();
-                        info!("finishing the task in time {}", t2.as_secs());
-                        counter_clone.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                        let mut to_sort = str.lock();
-                        let tasks = get_task(&mut gk, &t);
-                        for i in tasks {
-                            i.0.deps.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        info!("sorting here");
-                        to_sort.make_contiguous().sort_by(|a, b| {
-                            let m = find_wrapper_children(&mut gk, a.clone()).len();
-                            let n = find_wrapper_children(&mut gk, b.clone()).len();
-                            n.cmp(&m)
-                        });
-                        drop(to_sort);
-                        info!("dropped sort ");
-                        drop(p);
-                        info!("dropped p");
-                        drop(gk);
-                        info!("dropped gk");
-                    });
-                } else {
-                    drop(task_lock);
-                };
-            } else {
-                //info!("the last thing is {} ", pending);
-                drop(task_lock);
-                let counter_break = counter.load(std::sync::atomic::Ordering::Relaxed);
-                let k = store.lock();
-                if counter_break == 0 && k.is_empty() {
-                    drop(k);
-                    break;
-                }
-            }
-        } else {
-            let conter_brek = counter.load(std::sync::atomic::Ordering::Relaxed);
-            if conter_brek == 0 {
+        let Some(task) = queue_lock.iter().last() else {
+            let counter_break = counter.load(std::sync::atomic::Ordering::Relaxed);
+            if counter_break == 0 {
                 break;
             }
+            // better: actually wait for a task to complete; e.g. send a cheap notification via a channel, set a flag, whatever
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            continue;
+        };
+        let pending = task
+            .0
+            .unbuilt_dependencies
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if pending > 0 {
+            //info!("the last thing is {} ", pending);
+            let counter_break = counter.load(std::sync::atomic::Ordering::Relaxed);
+            if counter_break == 0 {
+                drop(queue_lock);
+                todo!("Cycle!")
+            } else {
+                // better: actually wait for a task to complete; e.g. send a cheap notification via a channel, set a flag, whatever
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
         }
+        // here the stack is popped, is there a way to pop from front and back asynchronously and getting tasks from front and back ?
+        // pending is last element of the queue we are sorting the queue all the time so it is possible that the last element is not 0 then there are cycles maybe ?
+        let Some(task) = queue_lock.pop_back() else {
+            // SAFETY: we know queue_lock.iter().last().is_some()
+            unsafe { unreachable_unchecked() }
+        };
+        info!("the task popped {:?}", task);
+        drop(queue_lock);
+
+        let counter = counter.clone();
+        let graph = graph.clone();
+        let queue = queue.clone();
+        // we move the data inside the thread
+        spawn_blocking(move || run_task(graph, queue, counter, task, permit));
     }
 }
 
-pub fn get_task<'a, T: Clone + Eq + Hash>(
-    graph: &'a mut [(Task<T>, Vec<Task<T>>)],
+enum ChannelMessage {
+    Task(task),
+    NoTasks,
+}
+
+fn run_task<T: Clone + Eq + std::hash::Hash + std::fmt::Debug>(
+    graph: DepencyMap<T>,
+    queue: Arc<Mutex<VecDeque<Task<T>>>>,
+    counter: Arc<std::sync::atomic::AtomicUsize>,
+    task: Task<T>,
+    permit: OwnedSemaphorePermit,
+) {
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // TEST ------------------------------------------------------------------
+    let now = std::time::Instant::now();
+    info!("time is {:?}", now);
+    //let child = find_wrapper_children(&mut gk, t.clone());
+    let t1 = now.elapsed();
+    info!("started the task {:?} at time {} secs", task, t1.as_secs());
+    std::thread::sleep(Duration::from_secs(task.0._num as u64));
+    let t2 = now.elapsed();
+    info!("finishing the task in time {}", t2.as_secs());
+    // -----------------------------------------------------------------------
+    counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    let mut queue_lock = queue.lock();
+    let mut graph_lock = graph.lock();
+    let tasks = get_children(&mut graph_lock, &task);
+    for i in tasks {
+        i.0.unbuilt_dependencies
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    info!("sorting here");
+    // v^ just swap with the last task that has the previous unbuilt-value
+    queue_lock.make_contiguous().sort_by(|a, b| {
+        let m = find_wrapper_children(&mut graph_lock, a.clone()).len();
+        let n = find_wrapper_children(&mut graph_lock, b.clone()).len();
+        n.cmp(&m)
+    });
+    // ^option 1 --------------------------------------------------------------
+    let tasks = get_children(&mut graph_lock, &task);
+    if tasks.is_empty() {
+        channel_sender.send(NoTasks);
+    } else {
+        for i in tasks {
+            if i.0.unbuilt_dependencies.fetch_sub(1, order) == 1 {
+                channel_sender.send(Task(i.clone()))
+            }
+        }
+    }
+    // alternative: use channel, then all of this is irrrelephant
+    drop(queue_lock);
+    info!("dropped sort ");
+    drop(graph_lock);
+    info!("dropped gk");
+
+    drop(permit);
+    info!("dropped p");
+}
+
+pub fn get_children<'a, T: Clone + Eq + Hash>(
+    graph: &'a [(Task<T>, Vec<Task<T>>)],
     task: &Task<T>,
-) -> Vec<&'a mut Task<T>> {
-    let mut x: Vec<_> = graph
-        .iter_mut()
+) -> impl Iterator<Item = &'a Task<T>> {
+    graph
+        .iter()
         .filter(|(_, t)| t.contains(task))
         .map(|(t, _)| t)
-        .collect();
-    x
 }
