@@ -155,6 +155,8 @@ pub async fn run_task_queue<T: Clone + Eq + Debug + Hash + Send + Sync + 'static
     while let Ok(p) = Semaphore::acquire_owned(semaphore.clone()).await {
         let mut task_lock = store.lock();
         // here we need to check the end of the task and if there are no dependencies left then only pop else
+        // Constantly checks the queue for some items until the semaphore permits are there
+        // What do we need here ? we need some kind of mechanism that can track time because if there are items then we need to check when they are executed
         if let Some(task) = task_lock.iter().last() {
             let pending = task.0.deps.load(std::sync::atomic::Ordering::Relaxed);
             let str = Arc::clone(&store);
@@ -169,11 +171,17 @@ pub async fn run_task_queue<T: Clone + Eq + Debug + Hash + Send + Sync + 'static
 
                     // we move the data inside the thread
                     spawn_blocking(move || {
+                        let time = std::time::Instant::now();
+                        info!("time is {:?}", time);
                         let t = task;
                         let mut gk = g.lock();
                         //let child = find_wrapper_children(&mut gk, t.clone());
                         counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let t1 = time.elapsed();
+                        info!("started the task {:?} at time {} secs", t, t1.as_secs());
                         sleep(Duration::from_secs(t.0._num as u64));
+                        let t2 = time.elapsed();
+                        info!("finishing the task in time {}", t2.as_secs());
                         counter_clone.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         let mut to_sort = str.lock();
                         let tasks = get_task(&mut gk, &t);
