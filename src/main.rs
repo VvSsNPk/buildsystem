@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::task::buildtask::BuildTaskId;
-use crate::task::{TaskMap, buildstep::STeX};
+use crate::task::buildstep::STeX;
 use buildsystem::cycle_handler::run2;
 use buildsystem::utils::time::{Delta, Timestamp};
 use either::Either;
