@@ -195,75 +195,75 @@ pub async fn run_task_queue<T: Clone + Eq + Debug + Hash + Send + Sync + 'static
         let graph = graph.clone();
         let queue = queue.clone();
         // we move the data inside the thread
-        spawn_blocking(move || run_task(graph, queue, counter, task, permit));
+        //spawn_blocking(move || run_task(graph, queue, counter, task, permit));
     }
 }
 
-enum ChannelMessage {
-    Task(task),
-    NoTasks,
-}
-
-fn run_task<T: Clone + Eq + std::hash::Hash + std::fmt::Debug>(
-    graph: DepencyMap<T>,
-    queue: Arc<Mutex<VecDeque<Task<T>>>>,
-    counter: Arc<std::sync::atomic::AtomicUsize>,
-    task: Task<T>,
-    permit: OwnedSemaphorePermit,
-) {
-    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // TEST ------------------------------------------------------------------
-    let now = std::time::Instant::now();
-    info!("time is {:?}", now);
-    //let child = find_wrapper_children(&mut gk, t.clone());
-    let t1 = now.elapsed();
-    info!("started the task {:?} at time {} secs", task, t1.as_secs());
-    std::thread::sleep(Duration::from_secs(task.0._num as u64));
-    let t2 = now.elapsed();
-    info!("finishing the task in time {}", t2.as_secs());
-    // -----------------------------------------------------------------------
-    counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    let mut queue_lock = queue.lock();
-    let mut graph_lock = graph.lock();
-    let tasks = get_children(&mut graph_lock, &task);
-    for i in tasks {
-        i.0.unbuilt_dependencies
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    }
-    info!("sorting here");
-    // v^ just swap with the last task that has the previous unbuilt-value
-    queue_lock.make_contiguous().sort_by(|a, b| {
-        let m = find_wrapper_children(&mut graph_lock, a.clone()).len();
-        let n = find_wrapper_children(&mut graph_lock, b.clone()).len();
-        n.cmp(&m)
-    });
-    // ^option 1 --------------------------------------------------------------
-    let tasks = get_children(&mut graph_lock, &task);
-    if tasks.is_empty() {
-        channel_sender.send(NoTasks);
-    } else {
-        for i in tasks {
-            if i.0.unbuilt_dependencies.fetch_sub(1, order) == 1 {
-                channel_sender.send(Task(i.clone()))
-            }
-        }
-    }
-    // alternative: use channel, then all of this is irrrelephant
-    drop(queue_lock);
-    info!("dropped sort ");
-    drop(graph_lock);
-    info!("dropped gk");
-
-    drop(permit);
-    info!("dropped p");
-}
-
-pub fn get_children<'a, T: Clone + Eq + Hash>(
-    graph: &'a [(Task<T>, Vec<Task<T>>)],
-    task: &Task<T>,
-) -> impl Iterator<Item = &'a Task<T>> {
-    graph
-        .iter()
-        .filter(|(_, t)| t.contains(task))
-        .map(|(t, _)| t)
-}
+// enum ChannelMessage {
+//     Task(task),
+//     NoTasks,
+// }
+//
+// fn run_task<T: Clone + Eq + std::hash::Hash + std::fmt::Debug>(
+//     graph: DepencyMap<T>,
+//     queue: Arc<Mutex<VecDeque<Task<T>>>>,
+//     counter: Arc<std::sync::atomic::AtomicUsize>,
+//     task: Task<T>,
+//     permit: OwnedSemaphorePermit,
+// ) {
+//     counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+//     // TEST ------------------------------------------------------------------
+//     let now = std::time::Instant::now();
+//     info!("time is {:?}", now);
+//     //let child = find_wrapper_children(&mut gk, t.clone());
+//     let t1 = now.elapsed();
+//     info!("started the task {:?} at time {} secs", task, t1.as_secs());
+//     std::thread::sleep(Duration::from_secs(task.0._num as u64));
+//     let t2 = now.elapsed();
+//     info!("finishing the task in time {}", t2.as_secs());
+//     // -----------------------------------------------------------------------
+//     counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+//     let mut queue_lock = queue.lock();
+//     let mut graph_lock = graph.lock();
+//     let tasks = get_children(&mut graph_lock, &task);
+//     for i in tasks {
+//         i.0.unbuilt_dependencies
+//             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+//     }
+//     info!("sorting here");
+//     // v^ just swap with the last task that has the previous unbuilt-value
+//     queue_lock.make_contiguous().sort_by(|a, b| {
+//         let m = find_wrapper_children(&mut graph_lock, a.clone()).len();
+//         let n = find_wrapper_children(&mut graph_lock, b.clone()).len();
+//         n.cmp(&m)
+//     });
+//     // ^option 1 --------------------------------------------------------------
+//     let tasks = get_children(&mut graph_lock, &task);
+//     if tasks.is_empty() {
+//         channel_sender.send(NoTasks);
+//     } else {
+//         for i in tasks {
+//             if i.0.unbuilt_dependencies.fetch_sub(1, order) == 1 {
+//                 channel_sender.send(Task(i.clone()))
+//             }
+//         }
+//     }
+//     // alternative: use channel, then all of this is irrrelephant
+//     drop(queue_lock);
+//     info!("dropped sort ");
+//     drop(graph_lock);
+//     info!("dropped gk");
+//
+//     drop(permit);
+//     info!("dropped p");
+// }
+//
+// pub fn get_children<'a, T: Clone + Eq + Hash>(
+//     graph: &'a [(Task<T>, Vec<Task<T>>)],
+//     task: &Task<T>,
+// ) -> impl Iterator<Item = &'a Task<T>> {
+//     graph
+//         .iter()
+//         .filter(|(_, t)| t.contains(task))
+//         .map(|(t, _)| t)
+// }

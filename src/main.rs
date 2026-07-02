@@ -8,6 +8,7 @@ use either::Either;
 use indexmap::IndexMap;
 use petgraph::Direction::Incoming;
 use petgraph::Graph;
+use petgraph::algo::TarjanScc;
 use petgraph::{
     graph::{DiGraph, NodeIndex},
     visit::{Dfs, DfsPostOrder, IntoNodeIdentifiers, Reversed, VisitMap},
@@ -18,10 +19,28 @@ pub mod macros;
 pub mod task;
 
 fn main() {
-    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
-    let mut k = VecDeque::from([3, 5, 7]);
-    k.make_contiguous().sort_by(|x, y| y.cmp(x));
-    println!("{:?}", k);
+    let mut  g = DiGraph::new();
+    let n1 = g.add_node(1);
+    let n2 = g.add_node(2);
+    let n3 = g.add_node(3);
+    let n4 = g.add_node(4);
+
+    g.add_edge(n1, n2, ());
+    g.add_edge(n2, n3, ());
+    g.add_edge(n3, n4, ());
+    g.add_edge(n4, n2, ());
+    
+    let mut tarjan = TarjanScc::default();
+    tarjan.run(&g, |x|{
+        println!("the scc are {:?}",x);
+    });
+
+
+
+    // tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+    // let mut k = VecDeque::from([3, 5, 7]);
+    // k.make_contiguous().sort_by(|x, y| y.cmp(x));
+    // println!("{:?}", k);
     // let (scss, t) = measure(|| {
     //     let (x, t) = measure(
     //         || //make_dep!(1 => 2,2 => 3,3=>4,4=>3,3=>5,5=>6,7=>6,8=> 7,9=>6,6=> 13,13=>14,15=>14,14=>12,16=>12,12=>11,11=>10,10=>6),
