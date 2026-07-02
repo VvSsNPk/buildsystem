@@ -32,11 +32,18 @@ impl<T: Finished + Clone> Scheduler<T> {
     // first to schedule we need next tasks that are no more zero so lets say I populated the graph now
     // i need to schedule i can schedule like say 4 tasks now I have to wait until I send them
     pub async fn schedule(&mut self) {
-        // this is a map to store the incoming edges
+        // this hashset is used to later remove nodes from graph
         let mut scheduled_set = HashSet::new();
+
+        // we get all nodes check as iterator using .node_indices()
         for i in self.graph.node_indices() {
             let weight = self.graph.node_weight(i).expect("not possible");
+
+            // we get node weight and check if its not finished that is task is still pending
             if !weight.is_finished() {
+                // we get neighbhours that are incoming and check whether all are 0
+                // if its so then just send it to the executor which lives some where else holds
+                // permits to schedule the tasks and update its state
                 let in_edges = self.graph.neighbors_directed(i, Incoming).count();
                 if in_edges == 0 {
                     self.sender
@@ -48,10 +55,17 @@ impl<T: Finished + Clone> Scheduler<T> {
             }
         }
 
+        // here we use the schedule_set to remove the nodes from the graph so late the graph becomes
+        // smaller to run kosaraju_scc
         for i in scheduled_set.iter() {
             self.graph.remove_node(*i);
         }
+
+        // if schedule_set is empty i.e there are no nodes incoming having 0 edges then we run kosaraju_scc
         if scheduled_set.is_empty() {
+            // here there is  a problem we are running kosaraju multiple times each call of
+            // schedule how to avoid that ? since graph reduces each time is it neccessary to call
+            // kosaraju here ?
             let sccs = kosaraju_scc(&self.graph);
 
             for i in sccs.iter().rev() {
