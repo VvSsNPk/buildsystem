@@ -1,41 +1,68 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Display;
 
-use crate::task::buildtask::BuildTaskId;
 use crate::task::buildstep::STeX;
-use buildsystem::cycle_handler::run2;
+use crate::task::buildtask::BuildTaskId;
+use buildsystem::cycle_handler::{find_wrapper_children, run2};
 use buildsystem::utils::time::{Delta, Timestamp};
 use either::Either;
 use indexmap::IndexMap;
 use petgraph::Direction::Incoming;
 use petgraph::Graph;
-use petgraph::algo::TarjanScc;
+use petgraph::graph::node_index;
+use petgraph::graphmap::NodeTrait;
+use petgraph::visit::{
+    DfsEvent, GraphBase, GraphRef, IntoNeighbors, Visitable, depth_first_search,
+};
 use petgraph::{
     graph::{DiGraph, NodeIndex},
     visit::{Dfs, DfsPostOrder, IntoNodeIdentifiers, Reversed, VisitMap},
 };
-use tracing::Level;
 
+use fixedbitset::FixedBitSet;
 pub mod macros;
 pub mod task;
 
 fn main() {
-    let mut  g = DiGraph::new();
-    let n1 = g.add_node(1);
-    let n2 = g.add_node(2);
-    let n3 = g.add_node(3);
-    let n4 = g.add_node(4);
+    let di_graph = DiGraph::<i32, ()>::from_edges([
+        (0, 1),
+        (1, 0),
+        (0, 2),
+        (2, 0),
+        (4, 6),
+        (0, 6),
+        (6, 0),
+        (2, 3),
+        (3, 2),
+        (2, 4),
+        (4, 2),
+        (6, 4),
+    ]);
 
-    g.add_edge(n1, n2, ());
-    g.add_edge(n2, n3, ());
-    g.add_edge(n3, n4, ());
-    g.add_edge(n4, n2, ());
-    
-    let mut tarjan = TarjanScc::default();
-    tarjan.run(&g, |x|{
-        println!("the scc are {:?}",x);
-    });
-
-
+    run_petgraph(&di_graph, node_index(0));
+    // let mut visited: HashSet<NodeIndex> = HashSet::new();
+    // let mut finished: Vec<NodeIndex> = vec![];
+    // let mut time = 0;
+    // depth_first_search(&di_graph, Some(node_index(0)), |e| match e {
+    //     DfsEvent::Discover(n, time) => {
+    //         println!("first run {:?}", n);
+    //     }
+    //     DfsEvent::TreeEdge(n, m) => {
+    //         //println!("we don't care about this {:?}", m);
+    //     }
+    //     DfsEvent::BackEdge(n, m) => {
+    //         if finished.contains(&m) {
+    //             println!("running {:?}", m)
+    //         }
+    //     }
+    //     DfsEvent::CrossForwardEdge(n, m) => {
+    //         //println!("we don't care here as well {:?}", m);
+    //     }
+    //     DfsEvent::Finish(n, time) => {
+    //         println!("running in finished {:?}", n);
+    //         finished.push(n);
+    //     }
+    // });
 
     // tracing_subscriber::fmt().with_max_level(Level::INFO).init();
     // let mut k = VecDeque::from([3, 5, 7]);
@@ -192,4 +219,59 @@ pub fn kosaraju(g: &DiGraph<(BuildTaskId, STeX), ()>) -> Vec<NodeIndex> {
         }
     }
     sccs
+}
+
+pub fn run2_copy<N: Eq + Clone + Copy>(g: &mut [(N, Vec<N>)], root: N) -> Vec<N> {
+    let mut current = 0;
+    let mut result = vec![root];
+    let mut remainder = vec![root];
+    while current != result.len() {
+        let x = result[current];
+        current += 1;
+        if result[0..current - 1].contains(&x) {
+            continue;
+        }
+        let f_c = find_wrapper_children(g, x).iter().filter(|n| **n != root);
+        for i in f_c {
+            if result[0..current - 1].contains(i) {
+                if !remainder.contains(i) {
+                    remainder.push(*i);
+                }
+            } else {
+                result.push(*i);
+            }
+        }
+    }
+    remainder.reverse();
+    result.extend_from_slice(&remainder);
+    result
+}
+
+pub fn run_petgraph<Nt, E>(g: &DiGraph<Nt, E>, root: NodeIndex) {
+    let mut stack = vec![root];
+    // This is just to check whether its already ran i think ?
+    let mut already_ran = HashSet::new();
+    let mut final_run = vec![root];
+
+    while let Some(n) = stack.pop() {
+        if !already_ran.contains(&n) {
+            println!("this is what is ran {:?}", n);
+            already_ran.insert(n);
+            let children = g.neighbors_directed(n, Incoming).filter(|n| *n != root);
+            let mut child2: Vec<_> = children.collect();
+            child2.reverse();
+            for i in child2 {
+                if already_ran.contains(&i) {
+                    if !final_run.contains(&i) {
+                        final_run.push(i);
+                    }
+                } else {
+                    stack.push(i);
+                }
+            }
+        }
+    }
+    for i in final_run {
+        println!("the final run again {:?}", i);
+    }
 }
