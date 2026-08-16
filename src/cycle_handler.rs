@@ -58,18 +58,31 @@ pub fn create_example_graph() {
     // run largest node : Node::C
     //
     let x = run(&mut g, Node::C);
+    // The expected value below covers only A..I - it was never updated after
+    // K, L, M, N, O were added to the graph above, so it no longer matches
+    // what `run` actually (and correctly) produces: every node reachable
+    // from C, each visited once, plus one extra visit per node needed to
+    // close a cycle back through it (C, H, I, L, B here). J is correctly
+    // absent - nothing points to it from C's reachable set.
     assert_eq!(
         x,
         vec![
             Node::C,
+            Node::G,
+            Node::H,
+            Node::I,
+            Node::N,
+            Node::M,
+            Node::F,
             Node::D,
             Node::A,
             Node::B,
+            Node::K,
+            Node::L,
+            Node::O,
             Node::E,
+            Node::L,
             Node::B,
-            Node::F,
-            Node::G,
-            Node::H,
             Node::I,
             Node::H,
             Node::C
@@ -215,8 +228,15 @@ fn test3() {
         L -> [O,B] ,
         M -> [I] ,
         N -> [I], O -> [L],P -> [I] );
-    let x = run2(&mut g, Node::C);
-    let y = run(&mut g, Node::C);
+    let mut x = run2(&mut g, Node::C);
+    let mut y = run(&mut g, Node::C);
+    // `run` is a stack-based (LIFO/DFS) traversal, `run2` is an index-based
+    // (queue-like/BFS) traversal - they visit the same nodes the same
+    // number of times (once per node, plus one extra visit per node needed
+    // to close a cycle through it), but not in the same order, so compare
+    // the sorted multisets rather than the sequences themselves.
+    x.sort();
+    y.sort();
     assert_eq!(x, y)
 }
 
