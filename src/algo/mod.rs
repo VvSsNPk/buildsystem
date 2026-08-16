@@ -1,7 +1,11 @@
 // here we store a key from the graph and send its value
 
-use std::collections::HashSet;
+use std::{
+    collections::{HashMap, HashSet},
+    hash::Hash,
+};
 
+use futures::channel::mpsc::Receiver;
 use petgraph::{
     Direction::{Incoming, Outgoing},
     algo::kosaraju_scc,
@@ -11,22 +15,42 @@ use petgraph::{
 };
 use tokio::sync::mpsc::Sender;
 
+use crate::{rec::State, scc::SccStore};
+
 pub trait Finished {
     fn is_finished(&self) -> bool;
 }
 // (id, step -> Taskstate)
 
-pub struct Scheduler<T: Finished + Clone> {
+pub struct Scheduler<T: Finished + Clone + Eq + Hash> {
     graph: StableDiGraph<T, ()>,
     sender: Sender<T>,
+    state_updater: Receiver<State<T>>,
+    scc_store: Option<SccStore<T>>,
+    in_flight: usize,
+    schedule_set: HashSet<NodeIndex>,
 }
-
-impl<T: Finished + Clone> Scheduler<T> {
-    pub fn new(sender: Sender<T>) -> Self {
+// The schedule set is empty doest not tell me why i should run the kosaraju_scc on the rest of the
+// graph because all could be in cycles.
+impl<T: Finished + Clone + Eq + Hash> Scheduler<T> {
+    pub fn new(sender: Sender<T>, state_updater: Receiver<State<T>>) -> Self {
         Self {
             graph: StableDiGraph::new(),
             sender,
+            state_updater,
+            scc_store: None,
+            in_flight: 0,
+            schedule_set: HashSet::new(),
         }
+    }
+
+    pub fn schedule_non_scc(&mut self) -> bool {
+        let mut scc_store = HashMap::new();
+        for i in self.graph.node_indices() {
+            let in_degree = self.graph.neighbors_directed(i, Incoming).count();
+            scc_store.insert(i, in_degree);
+        }
+        true
     }
 
     pub async fn schedule_scc(&mut self, scc: &[NodeIndex]) {
@@ -156,10 +180,9 @@ impl<T: Finished + Clone> Scheduler<T> {
         }
     }
 
+    // This function does sceduling uing topological sort
     pub async fn schedule_topo(&mut self) {
         // this hashset is used to later remove nodes from graph
-        let mut scheduled_set = HashSet::new();
-
         // we get all nodes check as iterator using .node_indices()
         for i in self.graph.node_indices() {
             let weight = self.graph.node_weight(i).expect("not possible");
@@ -175,15 +198,13 @@ impl<T: Finished + Clone> Scheduler<T> {
                         .send(weight.clone())
                         .await
                         .expect("reciever closed ?");
-                    scheduled_set.insert(i);
+                    self.in_flight += 0;
+                    self.schedule_set.insert(i);
                 }
             }
         }
 
         // here we use the schedule_set to remove the nodes from the graph so late the graph becomes
         // smaller to run kosaraju_scc
-        for i in scheduled_set.iter() {
-            self.graph.remove_node(*i);
-        }
     }
 }
