@@ -10,18 +10,32 @@
 // conflated those two things and could unblock a task's dependents before
 // the dependency had actually finished.
 
-use std::{collections::HashMap, hash::Hash};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    hash::Hash,
+};
 
 use petgraph::{
-    Direction::Incoming,
+    Direction::{Incoming, Outgoing},
     algo::kosaraju_scc,
     graph::{DiGraph, NodeIndex},
     stable_graph::StableDiGraph,
-    visit::NodeFiltered,
 };
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::rec::{ExecutorState, State};
+
+/// Result of one run of `Scheduler::drain_acyclic` (the shared Kahn's-only
+/// phase behind both `schedule` and `schedule_topo`).
+enum DrainOutcome {
+    /// Every node reached Finished/Failed.
+    Settled,
+    /// Nothing ready, nothing in flight, nodes still remain - the rest of
+    /// the graph is entirely cycles.
+    Stalled,
+    /// The executor's side of the channel closed mid-drain.
+    ExecutorGone,
+}
 
 pub struct Scheduler<T: Clone + Eq + Hash> {
     graph: StableDiGraph<T, ()>,
@@ -31,6 +45,21 @@ pub struct Scheduler<T: Clone + Eq + Hash> {
     // per-node execution state. Absent == ExecutorState::None (not yet
     // dispatched). This is the thing that changes instead of the graph.
     state: HashMap<NodeIndex, ExecutorState>,
+    // Kahn's algorithm, kept incremental instead of rescanned: number of
+    // not-yet-Finished dependencies remaining for each node (absent == 0).
+    // A node becomes ready the instant this hits 0 - decremented in
+    // `apply_state` when a dependency reports Finished, never recomputed
+    // from scratch.
+    pending: HashMap<NodeIndex, usize>,
+    // Nodes with pending == 0 that have never been dispatched - the
+    // frontier `dispatch_ready` drains. Populated once per node, either by
+    // `seed_ready` (nodes that started with no dependencies) or by
+    // `apply_state` (nodes whose last dependency just finished).
+    ready: VecDeque<NodeIndex>,
+    ready_seeded: bool,
+    // Count of nodes that have reached Finished or Failed, so `all_settled`
+    // is an O(1) comparison instead of an O(V) scan over every node.
+    settled_count: usize,
     sender: Sender<T>,
     state_updater: Receiver<State<T>>,
     // number of nodes dispatched (Queued or Running) but not yet
@@ -38,6 +67,29 @@ pub struct Scheduler<T: Clone + Eq + Hash> {
     // in-flight work" apart from "nothing ready because we're deadlocked on
     // a cycle".
     in_flight: usize,
+    // Nodes whose real dependency was paid off (pending hit 0) while they
+    // were still `Queued`/`Running` on a forced dispatch - i.e. the
+    // in-flight run started before it was actually safe to trust. Its
+    // report is discarded and it's redispatched immediately instead of
+    // being settled (see `apply_state`). This only covers the race where
+    // the payoff lands *before* the forced run reports back; the far more
+    // common case - payoff arriving *after* the forced run already
+    // finished - doesn't need this set at all (handled inline, see below).
+    reclose: HashSet<NodeIndex>,
+    // Nodes whose one-time Kahn "unblock my dependents" step has already
+    // run. A force-dispatched node can report Finished twice (once
+    // prematurely, once for real once its own dependency is satisfied,
+    // see `apply_state`) - this guards against decrementing its
+    // dependents' `pending` twice for the same edge, which would otherwise
+    // cause repeated bogus re-closes to ping-pong forever.
+    kahn_applied: HashSet<NodeIndex>,
+    // One-time cache of the graph's strongly connected components,
+    // computed lazily on first use by `unblock_one_cycle_node`. SCC
+    // membership is a pure function of graph topology, and topology never
+    // changes after construction (nodes/edges are never removed - see the
+    // top of this file), so recomputing it on every stall would be pure
+    // waste; every stall reuses this same partition instead.
+    sccs: Option<Vec<Vec<NodeIndex>>>,
 }
 
 impl<T: Clone + Eq + Hash> Scheduler<T> {
@@ -46,9 +98,16 @@ impl<T: Clone + Eq + Hash> Scheduler<T> {
             graph: StableDiGraph::new(),
             index: HashMap::new(),
             state: HashMap::new(),
+            pending: HashMap::new(),
+            ready: VecDeque::new(),
+            ready_seeded: false,
+            settled_count: 0,
             sender,
             state_updater,
             in_flight: 0,
+            reclose: HashSet::new(),
+            kahn_applied: HashSet::new(),
+            sccs: None,
         }
     }
 
@@ -70,9 +129,7 @@ impl<T: Clone + Eq + Hash> Scheduler<T> {
             remap.insert(old_idx, scheduler.add_task(weight));
         }
         for edge in graph.raw_edges() {
-            scheduler
-                .graph
-                .update_edge(remap[&edge.source()], remap[&edge.target()], ());
+            scheduler.link(remap[&edge.source()], remap[&edge.target()]);
         }
         scheduler
     }
@@ -92,50 +149,62 @@ impl<T: Clone + Eq + Hash> Scheduler<T> {
         self.get_or_insert(task)
     }
 
+    /// Add the edge `dep_idx -> dependent_idx` if it isn't already present,
+    /// keeping `pending` (dependent's not-yet-finished dependency count) in
+    /// sync. Only a genuinely new edge changes `pending` - calling this
+    /// twice for the same pair is a no-op the second time.
+    fn link(&mut self, dep_idx: NodeIndex, dependent_idx: NodeIndex) {
+        if self.graph.find_edge(dep_idx, dependent_idx).is_some() {
+            return;
+        }
+        self.graph.add_edge(dep_idx, dependent_idx, ());
+        if self.node_state(dep_idx) != ExecutorState::Finished {
+            *self.pending.entry(dependent_idx).or_insert(0) += 1;
+        }
+    }
+
     /// Record that `dependency` must finish before `dependent` can run.
     /// Idempotent: calling it twice for the same pair doesn't duplicate the
     /// edge.
     pub fn add_dependency(&mut self, dependency: T, dependent: T) {
         let dep_idx = self.get_or_insert(dependency);
         let dependent_idx = self.get_or_insert(dependent);
-        self.graph.update_edge(dep_idx, dependent_idx, ());
+        self.link(dep_idx, dependent_idx);
     }
 
     fn node_state(&self, idx: NodeIndex) -> ExecutorState {
         self.state.get(&idx).copied().unwrap_or(ExecutorState::None)
     }
 
-    /// Ready = never dispatched, and every dependency has actually
-    /// Finished (not just "sent" - Queued/Running don't count).
-    fn is_ready(&self, idx: NodeIndex) -> bool {
-        self.node_state(idx) == ExecutorState::None
-            && self
-                .graph
-                .neighbors_directed(idx, Incoming)
-                .all(|dep| self.node_state(dep) == ExecutorState::Finished)
+    fn node_pending(&self, idx: NodeIndex) -> usize {
+        self.pending.get(&idx).copied().unwrap_or(0)
     }
 
-    fn ready_nodes(&self) -> Vec<NodeIndex> {
-        self.graph
-            .node_indices()
-            .filter(|&i| self.is_ready(i))
-            .collect()
+    /// One-time O(V+E) Kahn setup: every node that started with no
+    /// dependencies is ready immediately. Everything after this is
+    /// incremental (see `apply_state`), so this only ever runs once.
+    fn seed_ready(&mut self) {
+        if self.ready_seeded {
+            return;
+        }
+        self.ready_seeded = true;
+        for idx in self.graph.node_indices() {
+            if self.node_pending(idx) == 0 {
+                self.ready.push_back(idx);
+            }
+        }
     }
 
     fn all_settled(&self) -> bool {
-        self.graph.node_indices().all(|i| {
-            matches!(
-                self.node_state(i),
-                ExecutorState::Finished | ExecutorState::Failed
-            )
-        })
+        self.settled_count == self.graph.node_count()
     }
 
     /// Send every currently-ready node to the executor. Marks each as
-    /// Queued immediately so the next scan never sends it again - this is
-    /// the replacement for removing the node from the graph.
+    /// Queued immediately so it can never be enqueued twice - this is the
+    /// replacement for removing the node from the graph.
     async fn dispatch_ready(&mut self) {
-        for idx in self.ready_nodes() {
+        self.seed_ready();
+        while let Some(idx) = self.ready.pop_front() {
             let weight = self
                 .graph
                 .node_weight(idx)
@@ -151,7 +220,9 @@ impl<T: Clone + Eq + Hash> Scheduler<T> {
     }
 
     /// Apply one state update coming back from the executor to the node it
-    /// refers to.
+    /// refers to. On a first-time transition to Finished, this is also
+    /// Kahn's "decrement dependents, enqueue any that just hit zero" step -
+    /// done incrementally here instead of rescanning the whole graph.
     fn apply_state(&mut self, update: State<T>) {
         let Some(&idx) = self.index.get(update.task()) else {
             // Update for a task this scheduler never dispatched - ignore
@@ -159,39 +230,121 @@ impl<T: Clone + Eq + Hash> Scheduler<T> {
             return;
         };
         let new_state = update.taskstate();
-        if matches!(new_state, ExecutorState::Finished | ExecutorState::Failed) {
+
+        // This report belongs to a forced dispatch whose real dependency
+        // was paid off *while it was still in flight* (see the
+        // `Queued | Running` arm below). That run was a throwaway - its
+        // result doesn't count, and it must not unblock its own
+        // dependents. Discard it and immediately redispatch for the real,
+        // dependency-respecting run instead of ever recording it settled.
+        if matches!(new_state, ExecutorState::Finished | ExecutorState::Failed)
+            && self.reclose.remove(&idx)
+        {
             self.in_flight = self.in_flight.saturating_sub(1);
+            self.state.insert(idx, ExecutorState::None);
+            self.ready.push_back(idx);
+            return;
+        }
+
+        let already_settled = matches!(
+            self.node_state(idx),
+            ExecutorState::Finished | ExecutorState::Failed
+        );
+        // `settled_count`/`in_flight` track *current* state, not history:
+        // a node forced through a premature run and later reset to `None`
+        // for its real run is "unsettled" again in between, and this needs
+        // to move back and forth with it exactly like the first time.
+        if !already_settled && matches!(new_state, ExecutorState::Finished | ExecutorState::Failed)
+        {
+            self.in_flight = self.in_flight.saturating_sub(1);
+            self.settled_count += 1;
+        }
+        // Kahn's "decrement dependents, enqueue any that just hit zero"
+        // step, by contrast, is keyed to the *edge*, not the report: it
+        // must run exactly once per node ever, no matter how many times
+        // that node reports Finished (a forced node reports it twice - see
+        // below). `kahn_applied` is the one-time guard for that, tracked
+        // separately from `state` so a later reset back to `None` doesn't
+        // make this fire again.
+        if new_state == ExecutorState::Finished && self.kahn_applied.insert(idx) {
+            let dependents: Vec<NodeIndex> =
+                self.graph.neighbors_directed(idx, Outgoing).collect();
+            for dep in dependents {
+                let p = self.pending.entry(dep).or_insert(0);
+                *p = p.saturating_sub(1);
+                if *p == 0 {
+                    match self.node_state(dep) {
+                        ExecutorState::None => self.ready.push_back(dep),
+                        ExecutorState::Queued | ExecutorState::Running => {
+                            // `dep` is mid-flight on a forced dispatch that
+                            // went out before its dependency on `idx` was
+                            // satisfied. Flag it: when that run reports
+                            // back, discard it and redispatch instead of
+                            // settling (see the `reclose` check above).
+                            self.reclose.insert(dep);
+                        }
+                        ExecutorState::Finished | ExecutorState::Failed => {
+                            // `dep` already finished its forced run before
+                            // we knew it truly depended on `idx`. Undo the
+                            // settlement and send it out again - this is
+                            // the real run, closing the cycle. Its own
+                            // `kahn_applied` entry stays put, so this
+                            // second run won't double-decrement whatever
+                            // *it* depends on.
+                            self.settled_count = self.settled_count.saturating_sub(1);
+                            self.state.insert(dep, ExecutorState::None);
+                            self.ready.push_back(dep);
+                        }
+                    }
+                }
+            }
         }
         self.state.insert(idx, new_state);
     }
 
-    /// Drive every node to Finished/Failed. Dispatches whatever is ready,
-    /// waits for the executor to report back, updates state, and repeats.
-    /// If we ever end up with nothing ready and nothing in flight while
-    /// nodes remain, the remainder is entirely cycles - break one edge's
-    /// worth of deadlock by force-dispatching the most-depended-on
-    /// undispatched node in the most "downstream" unresolved SCC, then
-    /// carry on; its dependents unblock normally once it reports Finished.
-    pub async fn schedule(&mut self) {
+    /// Phase 1, shared by `schedule` and `schedule_topo`: pure Kahn's
+    /// algorithm, no cycle-breaking. Dispatches whatever is ready, waits
+    /// for the executor to report back, updates state, and repeats until
+    /// either every node has settled or it stalls (nothing ready, nothing
+    /// in flight, nodes still remain - which can only mean a cycle).
+    async fn drain_acyclic(&mut self) -> DrainOutcome {
         loop {
             self.dispatch_ready().await;
 
             if self.all_settled() {
-                return;
+                return DrainOutcome::Settled;
             }
 
             if self.in_flight == 0 {
-                if !self.unblock_one_cycle_node().await {
-                    // nothing ready, nothing in flight, and no undispatched
-                    // node anywhere - genuinely nothing left to do.
-                    return;
-                }
-                continue;
+                return DrainOutcome::Stalled;
             }
 
             match self.state_updater.recv().await {
                 Some(update) => self.apply_state(update),
-                None => return, // executor side is gone
+                None => return DrainOutcome::ExecutorGone,
+            }
+        }
+    }
+
+    /// Drive every node to Finished/Failed. Runs the acyclic phase first;
+    /// if that stalls, the remainder is entirely cycles - break one edge's
+    /// worth of deadlock by force-dispatching the most-depended-on
+    /// undispatched node in the most "downstream" unresolved SCC, then
+    /// hand back to the acyclic phase, which carries on from there (its
+    /// dependents unblock normally once it reports Finished). Repeats
+    /// across as many separate cycles as the graph has.
+    pub async fn schedule(&mut self) {
+        loop {
+            match self.drain_acyclic().await {
+                DrainOutcome::Settled | DrainOutcome::ExecutorGone => return,
+                DrainOutcome::Stalled => {
+                    if !self.unblock_one_cycle_node().await {
+                        // nothing ready, nothing in flight, and no
+                        // undispatched node anywhere - genuinely nothing
+                        // left to do.
+                        return;
+                    }
+                }
             }
         }
     }
@@ -200,22 +353,8 @@ impl<T: Clone + Eq + Hash> Scheduler<T> {
     /// to break cycles - use when the caller has already guaranteed there
     /// are none.
     pub async fn schedule_topo(&mut self) {
-        loop {
-            self.dispatch_ready().await;
-
-            if self.all_settled() {
-                return;
-            }
-
-            assert!(
-                self.in_flight > 0,
-                "schedule_topo: stuck with no ready and no in-flight nodes - graph has a cycle"
-            );
-
-            match self.state_updater.recv().await {
-                Some(update) => self.apply_state(update),
-                None => return,
-            }
+        if let DrainOutcome::Stalled = self.drain_acyclic().await {
+            panic!("schedule_topo: stuck with no ready and no in-flight nodes - graph has a cycle");
         }
     }
 
@@ -223,40 +362,44 @@ impl<T: Clone + Eq + Hash> Scheduler<T> {
     /// the same "most downstream first" order Kahn's algorithm would peel
     /// them off in) and force-dispatch its most-depended-on undispatched
     /// member. Returns false if there was nothing left to unblock.
+    ///
+    /// `kosaraju_scc` only ever runs once per scheduler (see `sccs`) - a
+    /// settled node can make a cached component look more connected than
+    /// the *live* deadlock actually is (its edges have already had their
+    /// effect elsewhere), but that never hides a real candidate: removing
+    /// nodes from a graph can only split components apart, never merge
+    /// them, so every still-live cycle is entirely contained within one of
+    /// these cached components. Filtering each one down to its
+    /// undispatched (`None`) members - exactly like before - still finds
+    /// it, just without ever re-walking the graph to do so.
     async fn unblock_one_cycle_node(&mut self) -> bool {
-        // Feed kosaraju_scc a *view* over `self.graph` that skips settled
-        // (Finished/Failed) nodes, instead of physically removing them.
-        // NodeFiltered hides a node (and every edge touching it) from
-        // traversal without mutating the underlying graph at all, so this
-        // costs nothing beyond a state lookup per visited node/edge - no
-        // rebuild, no index invalidation, and `self.graph` stays the single
-        // source of truth for the whole task's lifetime.
-        let state = &self.state;
-        let pending = NodeFiltered::from_fn(&self.graph, |n| {
-            !matches!(
-                state.get(&n).copied().unwrap_or(ExecutorState::None),
-                ExecutorState::Finished | ExecutorState::Failed
-            )
-        });
-        let sccs = kosaraju_scc(&pending);
-        for scc in sccs.iter().rev() {
-            let candidate = scc
-                .iter()
-                .copied()
-                .filter(|&n| self.node_state(n) == ExecutorState::None)
-                .max_by_key(|&n| self.graph.neighbors_directed(n, Incoming).count());
-            if let Some(node) = candidate {
-                let weight = self.graph.node_weight(node).expect("in graph").clone();
-                self.sender
-                    .send(weight)
-                    .await
-                    .expect("executor channel closed");
-                self.state.insert(node, ExecutorState::Queued);
-                self.in_flight += 1;
-                return true;
-            }
+        if self.sccs.is_none() {
+            self.sccs = Some(kosaraju_scc(&self.graph));
         }
-        false
+        let candidate = self
+            .sccs
+            .as_ref()
+            .expect("just ensured Some")
+            .iter()
+            .rev()
+            .find_map(|scc| {
+                scc.iter()
+                    .copied()
+                    .filter(|&n| self.node_state(n) == ExecutorState::None)
+                    .max_by_key(|&n| self.graph.neighbors_directed(n, Incoming).count())
+            });
+
+        let Some(node) = candidate else {
+            return false;
+        };
+        let weight = self.graph.node_weight(node).expect("in graph").clone();
+        self.sender
+            .send(weight)
+            .await
+            .expect("executor channel closed");
+        self.state.insert(node, ExecutorState::Queued);
+        self.in_flight += 1;
+        true
     }
 }
 
@@ -327,9 +470,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn two_node_cycle_still_completes() {
-        // 0 -> 1 -> 0: unresolvable cycle. schedule() must force-dispatch
-        // one side instead of deadlocking, and both must still run.
+    async fn two_node_cycle_closes_by_rerunning_the_forced_node() {
+        // 0 -> 1 -> 0: unresolvable cycle. schedule() force-dispatches one
+        // side to break the deadlock, which lets the other side run for
+        // real and pay off the forced node's own dependency - so the
+        // forced node then runs a *second* time, for real, to actually
+        // close the cycle instead of just having its debt forgiven. Net
+        // result: one task runs twice, the other exactly once, and the
+        // once-only task's run falls strictly between the forced node's
+        // two runs.
         let (tx, rx) = tokio::sync::mpsc::channel::<u32>(16);
         let (stx, srx) = tokio::sync::mpsc::channel::<State<u32>>(16);
         let mut scheduler = Scheduler::new(tx, srx);
@@ -347,9 +496,20 @@ mod tests {
         handle.await.unwrap();
 
         let log = log.lock().unwrap();
-        assert_eq!(log.len(), 2);
-        assert!(log.contains(&0));
-        assert!(log.contains(&1));
+        assert_eq!(log.len(), 3, "one task should rerun to close the cycle: {log:?}");
+        let count_of = |t: u32| log.iter().filter(|&&x| x == t).count();
+        let forced = if count_of(0) == 2 { 0 } else { 1 };
+        let other = 1 - forced;
+        assert_eq!(count_of(forced), 2, "forced node should run twice: {log:?}");
+        assert_eq!(count_of(other), 1, "other node should run once: {log:?}");
+
+        let first_forced_run = log.iter().position(|&x| x == forced).unwrap();
+        let other_run = log.iter().position(|&x| x == other).unwrap();
+        let second_forced_run = log.iter().rposition(|&x| x == forced).unwrap();
+        assert!(
+            first_forced_run < other_run && other_run < second_forced_run,
+            "closing run must come after the other node, which must come after the forced node's first run: {log:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -379,9 +539,79 @@ mod tests {
         handle.await.unwrap();
 
         let log = log.lock().unwrap();
-        assert_eq!(log.len(), 5);
+        // One member of the 3-cycle is forced early and reruns once its
+        // own dependency is paid off by the rest of the cycle, so the
+        // cycle contributes 4 runs (not 3) on top of 10/11's one run each.
+        assert_eq!(log.len(), 6, "one cycle member should rerun to close the cycle: {log:?}");
+        let count_of = |t: u32| log.iter().filter(|&&x| x == t).count();
         for t in [10, 11, 20, 21, 22] {
-            assert!(log.contains(&t), "task {t} never ran: {log:?}");
+            assert!(count_of(t) >= 1, "task {t} never ran: {log:?}");
         }
+        let reran: Vec<u32> = [10, 11, 20, 21, 22]
+            .into_iter()
+            .filter(|&t| count_of(t) == 2)
+            .collect();
+        assert_eq!(
+            reran.len(),
+            1,
+            "exactly one task should rerun to close the cycle: {log:?}"
+        );
+        assert!(
+            [20, 21, 22].contains(&reran[0]),
+            "only a cycle member should ever rerun, not {}: {log:?}",
+            reran[0]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multiple_disjoint_cycles_share_one_cached_scc_pass() {
+        // Two independent 2-cycles - 0<->1 and 2<->3 - with no edges
+        // between them. `schedule` stalls once per cycle, so
+        // `unblock_one_cycle_node` runs twice; both calls must be served
+        // from the same cached `sccs` (kosaraju runs at most once for the
+        // scheduler's whole lifetime - see its doc comment) and still
+        // resolve both cycles correctly.
+        let (tx, rx) = tokio::sync::mpsc::channel::<u32>(16);
+        let (stx, srx) = tokio::sync::mpsc::channel::<State<u32>>(16);
+        let mut scheduler = Scheduler::new(tx, srx);
+        scheduler.add_dependency(0, 1);
+        scheduler.add_dependency(1, 0);
+        scheduler.add_dependency(2, 3);
+        scheduler.add_dependency(3, 2);
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let handle = spawn_executor(4, rx, stx, log.clone());
+
+        tokio::time::timeout(Duration::from_secs(5), scheduler.schedule())
+            .await
+            .expect("scheduler must not deadlock on multiple disjoint cycles");
+
+        drop(scheduler);
+        handle.await.unwrap();
+
+        let log = log.lock().unwrap();
+        let count_of = |t: u32| log.iter().filter(|&&x| x == t).count();
+        for t in [0, 1, 2, 3] {
+            assert!(count_of(t) >= 1, "task {t} never ran: {log:?}");
+        }
+        let reran: Vec<u32> = [0, 1, 2, 3]
+            .into_iter()
+            .filter(|&t| count_of(t) == 2)
+            .collect();
+        assert_eq!(
+            reran.len(),
+            2,
+            "exactly one member of each cycle should rerun: {log:?}"
+        );
+        assert_ne!(
+            reran.contains(&0),
+            reran.contains(&1),
+            "exactly one of {{0,1}} should rerun: {log:?}"
+        );
+        assert_ne!(
+            reran.contains(&2),
+            reran.contains(&3),
+            "exactly one of {{2,3}} should rerun: {log:?}"
+        );
     }
 }
