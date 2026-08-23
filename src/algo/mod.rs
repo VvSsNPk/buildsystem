@@ -267,8 +267,7 @@ impl<T: Clone + Eq + Hash> Scheduler<T> {
         // separately from `state` so a later reset back to `None` doesn't
         // make this fire again.
         if new_state == ExecutorState::Finished && self.kahn_applied.insert(idx) {
-            let dependents: Vec<NodeIndex> =
-                self.graph.neighbors_directed(idx, Outgoing).collect();
+            let dependents: Vec<NodeIndex> = self.graph.neighbors_directed(idx, Outgoing).collect();
             for dep in dependents {
                 let p = self.pending.entry(dep).or_insert(0);
                 *p = p.saturating_sub(1);
@@ -496,7 +495,11 @@ mod tests {
         handle.await.unwrap();
 
         let log = log.lock().unwrap();
-        assert_eq!(log.len(), 3, "one task should rerun to close the cycle: {log:?}");
+        assert_eq!(
+            log.len(),
+            3,
+            "one task should rerun to close the cycle: {log:?}"
+        );
         let count_of = |t: u32| log.iter().filter(|&&x| x == t).count();
         let forced = if count_of(0) == 2 { 0 } else { 1 };
         let other = 1 - forced;
@@ -542,7 +545,11 @@ mod tests {
         // One member of the 3-cycle is forced early and reruns once its
         // own dependency is paid off by the rest of the cycle, so the
         // cycle contributes 4 runs (not 3) on top of 10/11's one run each.
-        assert_eq!(log.len(), 6, "one cycle member should rerun to close the cycle: {log:?}");
+        assert_eq!(
+            log.len(),
+            6,
+            "one cycle member should rerun to close the cycle: {log:?}"
+        );
         let count_of = |t: u32| log.iter().filter(|&&x| x == t).count();
         for t in [10, 11, 20, 21, 22] {
             assert!(count_of(t) >= 1, "task {t} never ran: {log:?}");
